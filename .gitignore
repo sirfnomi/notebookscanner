@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
+venv/
+env/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Pipeline temporary and generated output files
+pipeline_outputs/
+test_outputs/
+_processed_temp/
+input_images/_processed_temp/
+*.pdf
+
+# Operating System
+.DS_Store
+Thumbs.db
