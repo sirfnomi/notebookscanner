@@ -23,3 +23,5 @@ input_images/_processed_temp/
 # Operating System
 .DS_Store
 Thumbs.db
+
+models/

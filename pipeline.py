@@ -1,40 +1,140 @@
 """
 Next-Gen AI Document & Book Scanner Engine - Core Pipeline
-Implements:
-1. Auto-Orientation & Fine Deskew
-2. 4-Corner Document Boundary Detection & Perspective Rectification (Homography)
-3. Non-Rigid 3D Surface Dewarping
-4. Finger & Thumb Margin Inpainting
-5. CamScanner/vFlat-Style Illumination Regularization & Paper Whitening
-6. Multi-Page PDF Assembly
+Powered by Deep Learning:
+1. Deep Learning (MobileNetV3) Document Corner Keypoint Detector & Perspective Rectification
+2. Auto-Orientation & Deskew Normalization
+3. Finger & Thumb Inpainting
+4. vFlat-Style Illumination Regularization & Paper Whitening
+5. Multi-Page PDF Assembly
 """
 
 import os
 import time
 import glob
+import urllib.request
 import cv2
 import numpy as np
 import img2pdf
+import onnxruntime as ort
+
+MODEL_URL = "https://huggingface.co/spaces/KennethTM/document_corner_detector/resolve/main/models/timm-mobilenetv3_small_100.onnx"
+MODEL_PATH = "models/timm-mobilenetv3_small_100.onnx"
 
 
-def order_points(pts: np.ndarray) -> np.ndarray:
-    """Orders 4 points as: top-left, top-right, bottom-right, bottom-left"""
-    rect = np.zeros((4, 2), dtype="float32")
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]      # top-left
-    rect[2] = pts[np.argmax(s)]      # bottom-right
+def ensure_ai_model():
+    """Ensures the Deep Learning corner detection model is downloaded."""
+    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
+    if not os.path.exists(MODEL_PATH) or os.path.getsize(MODEL_PATH) < 1000000:
+        print("Downloading Deep Learning Document Corner Detector (13.7 MB)...")
+        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+        print("Model downloaded successfully!")
 
-    diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]   # top-right
-    rect[3] = pts[np.argmax(diff)]   # bottom-left
-    return rect
+
+class AIDocumentCornerDetector:
+    """Deep Learning Neural Network for 4-Corner Document Detection & Perspective Warp"""
+    _session = None
+
+    @classmethod
+    def get_session(cls):
+        if cls._session is None:
+            ensure_ai_model()
+            cls._session = ort.InferenceSession(MODEL_PATH)
+        return cls._session
+
+    @staticmethod
+    def normalize_image(image, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)):
+        image = (image / 255.0).astype("float32")
+        image[:, :, 0] = (image[:, :, 0] - mean[0]) / std[0]
+        image[:, :, 1] = (image[:, :, 1] - mean[1]) / std[1]
+        image[:, :, 2] = (image[:, :, 2] - mean[2]) / std[2]
+        return image
+
+    @staticmethod
+    def resize_longest_max_size(image, max_size=224):
+        height, width = image.shape[:2]
+        ratio = max_size / max(width, height)
+        new_width = int(width * ratio)
+        new_height = int(height * ratio)
+        return cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
+
+    @staticmethod
+    def pad_if_needed(image, target_size=224):
+        height, width, _ = image.shape
+        y0 = abs((height - target_size) // 2)
+        x0 = abs((width - target_size) // 2)
+        background = np.zeros((target_size, target_size, 3), dtype="uint8")
+        background[y0:(y0 + height), x0:(x0 + width), :] = image
+        return background
+
+    @staticmethod
+    def heatmap2keypoints(heatmap: np.ndarray, img_size: int = 224) -> list:
+        indx = heatmap.reshape(-1, img_size * img_size).argmax(axis=1)
+        row = indx // img_size
+        col = indx % img_size
+        return np.stack((col, row), axis=1).tolist()
+
+    @staticmethod
+    def centercrop_keypoints(keypoints, crop_height, crop_width, img_size=224):
+        y_diff = (img_size - crop_height) // 2
+        x_diff = (img_size - crop_width) // 2
+        return [[x - x_diff, y - y_diff] for x, y in keypoints]
+
+    @staticmethod
+    def resize_keypoints(keypoints, current_height, current_width, target_height, target_width):
+        return [[int((x / current_width) * target_width), int((y / current_height) * target_height)] for x, y in keypoints]
+
+    @classmethod
+    def predict_corners(cls, image_bgr: np.ndarray) -> np.ndarray:
+        session = cls.get_session()
+        input_name = session.get_inputs()[0].name
+        output_name = session.get_outputs()[0].name
+
+        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        h, w, _ = image_rgb.shape
+
+        image_resize = cls.resize_longest_max_size(image_rgb)
+        h_small, w_small, _ = image_resize.shape
+        image_pad = cls.pad_if_needed(image_resize, target_size=224)
+        image_norm = cls.normalize_image(image_pad)
+        image_array = np.transpose(image_norm, (2, 0, 1))
+        image_array = np.expand_dims(image_array, axis=0)
+
+        output = session.run([output_name], {input_name: image_array})
+        output_keypoints = cls.heatmap2keypoints(output[0].squeeze())
+        crop_keypoints = cls.centercrop_keypoints(output_keypoints, h_small, w_small, 224)
+        large_keypoints = cls.resize_keypoints(crop_keypoints, h_small, w_small, h, w)
+        return np.float32(large_keypoints)
+
+    @classmethod
+    def warp_perspective(cls, image_bgr: np.ndarray) -> np.ndarray:
+        pts = cls.predict_corners(image_bgr)
+        # pts order: TL, TR, BR, BL
+        w_top = np.linalg.norm(pts[1] - pts[0])
+        w_bot = np.linalg.norm(pts[2] - pts[3])
+        target_w = int(max(w_top, w_bot))
+
+        h_left = np.linalg.norm(pts[3] - pts[0])
+        h_right = np.linalg.norm(pts[2] - pts[1])
+        target_h = int(max(h_left, h_right))
+
+        if target_w < 100 or target_h < 100:
+            return image_bgr
+
+        target_pts = np.float32([
+            [0, 0],
+            [target_w - 1, 0],
+            [target_w - 1, target_h - 1],
+            [0, target_h - 1]
+        ])
+
+        M = cv2.getPerspectiveTransform(pts, target_pts)
+        return cv2.warpPerspective(image_bgr, M, (target_w, target_h), flags=cv2.INTER_CUBIC)
 
 
 class DocumentPreprocessingEngine:
-    """Engine 1: Auto-Orientation & Deskew Normalization"""
+    """Orientation and subtle rotation normalization"""
     @staticmethod
     def detect_and_fix_orientation(image: np.ndarray) -> np.ndarray:
-        """Detect 0, 90, 180, 270 degree rotation and rotate upright."""
         try:
             import pytesseract
             small = cv2.resize(image, (640, int(640 * image.shape[0] / image.shape[1])))
@@ -50,143 +150,17 @@ class DocumentPreprocessingEngine:
             pass
         return image
 
-    @staticmethod
-    def deskew(image: np.ndarray, max_angle: float = 15.0) -> np.ndarray:
-        """Correct subtle skew angles within +/- 15 degrees."""
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        edges = cv2.Canny(gray, 50, 150, apertureSize=3)
-        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=100, minLineLength=100, maxLineGap=10)
-        if lines is None:
-            return image
-
-        lines = lines.reshape(-1, 4)
-        angles = []
-        for x1, y1, x2, y2 in lines:
-            theta = np.degrees(np.arctan2(float(y2 - y1), float(x2 - x1)))
-            if abs(theta) <= max_angle:
-                angles.append(theta)
-            elif abs(abs(theta) - 90) <= max_angle:
-                angles.append(theta - 90 if theta > 0 else theta + 90)
-
-        if not angles:
-            return image
-
-        median_angle = float(np.median(angles))
-        if abs(median_angle) < 0.2:
-            return image
-
-        h, w = image.shape[:2]
-        center = (w // 2, h // 2)
-        rot_mat = cv2.getRotationMatrix2D(center, median_angle, 1.0)
-        return cv2.warpAffine(image, rot_mat, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-
-
-class DocumentGeometryEngine:
-    """Engine 2 & 3: 4-Corner Quad Perspective Rectification & 3D Dewarping"""
-    @staticmethod
-    def detect_and_warp_quad(image: np.ndarray) -> np.ndarray:
-        """
-        Detects 4 outer page corners using multi-scale bilateral contour analysis.
-        Warps perspective to an un-slanted, flat rectangular page.
-        """
-        orig = image.copy()
-        h, w = image.shape[:2]
-
-        scale = 1000.0 / max(h, w)
-        small_h, small_w = int(h * scale), int(w * scale)
-        small = cv2.resize(image, (small_w, small_h), interpolation=cv2.INTER_AREA)
-
-        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.bilateralFilter(gray, 9, 75, 75)
-        edges = cv2.Canny(blurred, 30, 120)
-
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=3)
-
-        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        best_quad = None
-        max_area = 0
-        total_area = small_w * small_h
-
-        sorted_contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
-        for c in sorted_contours:
-            area = cv2.contourArea(c)
-            if area < total_area * 0.40:
-                continue
-
-            peri = cv2.arcLength(c, True)
-            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-
-            if len(approx) == 4 and area > max_area:
-                best_quad = approx.reshape(4, 2)
-                max_area = area
-                break
-
-        if best_quad is None and sorted_contours:
-            largest = sorted_contours[0]
-            if cv2.contourArea(largest) > total_area * 0.40:
-                hull = cv2.convexHull(largest)
-                peri = cv2.arcLength(hull, True)
-                approx = cv2.approxPolyDP(hull, 0.03 * peri, True)
-                if len(approx) == 4:
-                    best_quad = approx.reshape(4, 2)
-
-        if best_quad is not None:
-            pts = best_quad / scale
-            rect = order_points(pts)
-            (tl, tr, br, bl) = rect
-
-            width_a = np.linalg.norm(br - bl)
-            width_b = np.linalg.norm(tr - tl)
-            max_w = max(int(width_a), int(width_b))
-
-            height_a = np.linalg.norm(tr - br)
-            height_b = np.linalg.norm(tl - bl)
-            max_h = max(int(height_a), int(height_b))
-
-            dst = np.array([
-                [0, 0],
-                [max_w - 1, 0],
-                [max_w - 1, max_h - 1],
-                [0, max_h - 1]
-            ], dtype="float32")
-
-            M = cv2.getPerspectiveTransform(rect, dst)
-            return cv2.warpPerspective(orig, M, (max_w, max_h), flags=cv2.INTER_CUBIC)
-
-        return orig
-
-    @staticmethod
-    def dewarp_3d_surface(image: np.ndarray, strength: float = 0.0) -> np.ndarray:
-        """
-        Adaptive 3D curvature unrolling. Strength 0.0 preserves planar lines.
-        """
-        if strength <= 0.0:
-            return image
-
-        h, w = image.shape[:2]
-        grid_x, grid_y = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
-
-        curve_profile = np.sin(np.linspace(0, np.pi, h))[:, None]
-        horizontal_decay = np.exp(-((grid_x - (w * 0.15)) / (w * 0.25)) ** 2)
-        displacement_x = curve_profile * horizontal_decay * (w * strength)
-
-        map_x = np.clip(grid_x - displacement_x, 0, w - 1).astype(np.float32)
-        map_y = grid_y.astype(np.float32)
-
-        return cv2.remap(image, map_x, map_y, interpolation=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-
 
 class OcclusionRemovalEngine:
-    """Engine 4: Finger / Thumb Segmentation & Clean Margin Inpainting"""
+    """Finger / Thumb Segmentation & Clean Margin Inpainting"""
     @staticmethod
     def detect_finger_mask(image: np.ndarray) -> np.ndarray:
         h, w = image.shape[:2]
         mask = np.zeros((h, w), dtype=np.uint8)
 
         border_mask = np.zeros((h, w), dtype=np.uint8)
-        border_w = int(w * 0.10)
-        border_h = int(h * 0.10)
+        border_w = int(w * 0.08)
+        border_h = int(h * 0.08)
         border_mask[:border_h, :] = 255
         border_mask[-border_h:, :] = 255
         border_mask[:, :border_w] = 255
@@ -220,28 +194,23 @@ class OcclusionRemovalEngine:
 
 
 class IlluminationRegularizationEngine:
-    """Engine 5: Paper Whitening & Spine Shadow Elimination (vFlat / CamScanner Magic Color)"""
+    """vFlat / CamScanner-Style Illumination Regularization & Paper Whitening"""
     @staticmethod
     def whiten_paper_vflat_style(image: np.ndarray, whiteness_gain: float = 1.15) -> np.ndarray:
-        """
-        1. Estimates smooth background illumination in LAB luminance space.
-        2. Neutralizes shadows and maps paper to clean white.
-        3. Preserves blue ink, red margin lines, and pen strokes with high contrast.
-        """
         lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
 
         h, w = l.shape
         scale = 800.0 / max(h, w)
         sw, sh = int(w * scale), int(h * scale)
-        l_small = cv2.resize(l, (sw, sh), interpolation=cv2.INTER_AREA)
+        l_small = cv2.resize(l, (sw, sh))
 
         k_size = 51
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_size, k_size))
         bg_small = cv2.morphologyEx(l_small, cv2.MORPH_CLOSE, kernel)
         bg_small = cv2.GaussianBlur(bg_small, (51, 51), 0)
 
-        bg = cv2.resize(bg_small, (w, h), interpolation=cv2.INTER_CUBIC)
+        bg = cv2.resize(bg_small, (w, h))
 
         l_float = l.astype(np.float32)
         bg_float = np.maximum(bg.astype(np.float32), 1.0)
@@ -261,14 +230,11 @@ class IlluminationRegularizationEngine:
 
 
 class ScannerPipelineOrchestrator:
-    """End-to-End Batch Orchestrator and PDF Assembly"""
-    def __init__(self, enable_orientation: bool = True, enable_deskew: bool = True,
-                 enable_crop: bool = True, enable_dewarp: bool = False,
+    """End-to-End Deep Learning Batch Orchestrator and PDF Assembly"""
+    def __init__(self, enable_orientation: bool = True, enable_ai_warp: bool = True,
                  enable_finger_removal: bool = True, enable_whitening: bool = True):
         self.enable_orientation = enable_orientation
-        self.enable_deskew = enable_deskew
-        self.enable_crop = enable_crop
-        self.enable_dewarp = enable_dewarp
+        self.enable_ai_warp = enable_ai_warp
         self.enable_finger_removal = enable_finger_removal
         self.enable_whitening = enable_whitening
 
@@ -277,44 +243,35 @@ class ScannerPipelineOrchestrator:
         stages = {'0_raw': image.copy()}
         current = image.copy()
 
-        # 1. Orientation & Deskew
+        # 1. Orientation
         t0 = time.time()
         if self.enable_orientation:
             current = DocumentPreprocessingEngine.detect_and_fix_orientation(current)
-        if self.enable_deskew:
-            current = DocumentPreprocessingEngine.deskew(current)
-        timings['orientation_deskew_ms'] = round((time.time() - t0) * 1000, 1)
+        timings['orientation_ms'] = round((time.time() - t0) * 1000, 1)
         stages['1_oriented'] = current.copy()
 
-        # 2. 4-Corner Quad Perspective Warp & Isolation
+        # 2. Deep Learning 4-Corner Detection & Perspective Rectification
         t0 = time.time()
-        if self.enable_crop:
-            current = DocumentGeometryEngine.detect_and_warp_quad(current)
-        timings['crop_perspective_ms'] = round((time.time() - t0) * 1000, 1)
-        stages['2_cropped_quad'] = current.copy()
+        if self.enable_ai_warp:
+            current = AIDocumentCornerDetector.warp_perspective(current)
+        timings['ai_perspective_warp_ms'] = round((time.time() - t0) * 1000, 1)
+        stages['2_ai_warped'] = current.copy()
 
-        # 3. 3D Dewarp (Adaptive)
-        t0 = time.time()
-        if self.enable_dewarp:
-            current = DocumentGeometryEngine.dewarp_3d_surface(current, strength=0.02)
-        timings['dewarp_3d_ms'] = round((time.time() - t0) * 1000, 1)
-        stages['3_dewarped'] = current.copy()
-
-        # 4. Finger Removal
+        # 3. Finger Removal
         t0 = time.time()
         if self.enable_finger_removal:
             mask = OcclusionRemovalEngine.detect_finger_mask(current)
             stages['finger_mask'] = mask.copy()
             current = OcclusionRemovalEngine.inpaint_fingers(current, mask)
         timings['finger_removal_ms'] = round((time.time() - t0) * 1000, 1)
-        stages['4_inpainted'] = current.copy()
+        stages['3_inpainted'] = current.copy()
 
-        # 5. Paper Whitening & Illumination Regularization
+        # 4. Paper Whitening & Illumination Regularization
         t0 = time.time()
         if self.enable_whitening:
             current = IlluminationRegularizationEngine.whiten_paper_vflat_style(current)
         timings['whitening_ms'] = round((time.time() - t0) * 1000, 1)
-        stages['5_whitened_final'] = current.copy()
+        stages['4_whitened_final'] = current.copy()
 
         timings['total_pipeline_ms'] = round(sum(timings.values()), 1)
         return {'final': current, 'stages': stages, 'timings': timings}
@@ -335,10 +292,9 @@ class ScannerPipelineOrchestrator:
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="AI Book & Document Scanner Engine")
+    parser = argparse.ArgumentParser(description="AI Book & Document Scanner Engine (Deep Learning)")
     parser.add_argument("--input", "-i", type=str, default="input_images", help="Input directory of image photos")
     parser.add_argument("--output", "-o", type=str, default="scanned_book.pdf", help="Output PDF file path")
-    parser.add_argument("--dewarp", action="store_true", help="Enable 3D spine dewarping")
     args = parser.parse_args()
 
     extensions = ('*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG')
@@ -351,8 +307,8 @@ def main():
         print(f"No image files found in {args.input}.")
         return
 
-    print(f"Found {len(images)} images in {args.input}. Processing...")
-    orchestrator = ScannerPipelineOrchestrator(enable_dewarp=args.dewarp)
+    print(f"Found {len(images)} images in {args.input}. Processing with Deep Learning...")
+    orchestrator = ScannerPipelineOrchestrator()
 
     temp_out_dir = os.path.join(args.input, "_processed_temp")
     os.makedirs(temp_out_dir, exist_ok=True)
