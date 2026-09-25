@@ -2,10 +2,10 @@
 Next-Gen AI Document & Book Scanner Engine - Core Pipeline
 Implements:
 1. Auto-Orientation & Fine Deskew
-2. Crop with Margin Compensation
-3. 3D Non-Rigid Spine Dewarping
-4. Finger & Thumb Inpainting
-5. Spine Shadow Removal & Paper Whitening
+2. 4-Corner Document Boundary Detection & Perspective Rectification (Homography)
+3. Non-Rigid 3D Surface Dewarping
+4. Finger & Thumb Margin Inpainting
+5. CamScanner/vFlat-Style Illumination Regularization & Paper Whitening
 6. Multi-Page PDF Assembly
 """
 
@@ -15,6 +15,19 @@ import glob
 import cv2
 import numpy as np
 import img2pdf
+
+
+def order_points(pts: np.ndarray) -> np.ndarray:
+    """Orders 4 points as: top-left, top-right, bottom-right, bottom-left"""
+    rect = np.zeros((4, 2), dtype="float32")
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]      # top-left
+    rect[2] = pts[np.argmax(s)]      # bottom-right
+
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]   # top-right
+    rect[3] = pts[np.argmax(diff)]   # bottom-left
+    return rect
 
 
 class DocumentPreprocessingEngine:
@@ -34,7 +47,7 @@ class DocumentPreprocessingEngine:
             elif angle == 270:
                 return cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
         except Exception:
-            pass  # Fallback to current orientation if OSD unavailable
+            pass
         return image
 
     @staticmethod
@@ -69,48 +82,94 @@ class DocumentPreprocessingEngine:
 
 
 class DocumentGeometryEngine:
-    """Engine 2 & 3: Crop, Margin Offset & Non-Rigid 3D Dewarping"""
+    """Engine 2 & 3: 4-Corner Quad Perspective Rectification & 3D Dewarping"""
     @staticmethod
-    def crop_with_margin(image: np.ndarray, margin_ratio: float = 0.02) -> np.ndarray:
-        """Isolate the page boundary and apply a safety padding margin to avoid clipping edge text."""
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (7, 7), 0)
-        thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+    def detect_and_warp_quad(image: np.ndarray) -> np.ndarray:
+        """
+        Detects 4 outer page corners using multi-scale bilateral contour analysis.
+        Warps perspective to an un-slanted, flat rectangular page.
+        """
+        orig = image.copy()
+        h, w = image.shape[:2]
 
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            return image
+        scale = 1000.0 / max(h, w)
+        small_h, small_w = int(h * scale), int(w * scale)
+        small = cv2.resize(image, (small_w, small_h), interpolation=cv2.INTER_AREA)
 
-        c = max(contours, key=cv2.contourArea)
-        x, y, w, h = cv2.boundingRect(c)
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.bilateralFilter(gray, 9, 75, 75)
+        edges = cv2.Canny(blurred, 30, 120)
 
-        img_h, img_w = image.shape[:2]
-        if w * h < (img_w * img_h * 0.35):
-            return image
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=3)
 
-        pad_x = int(w * margin_ratio)
-        pad_y = int(h * margin_ratio)
-        x1 = max(0, x - pad_x)
-        y1 = max(0, y - pad_y)
-        if y2 <= y1 or x2 <= x1:
-            return image
-        cropped = image[y1:y2, x1:x2]
-        return cropped if cropped.size > 0 else image
+        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        best_quad = None
+        max_area = 0
+        total_area = small_w * small_h
+
+        sorted_contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
+        for c in sorted_contours:
+            area = cv2.contourArea(c)
+            if area < total_area * 0.40:
+                continue
+
+            peri = cv2.arcLength(c, True)
+            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+
+            if len(approx) == 4 and area > max_area:
+                best_quad = approx.reshape(4, 2)
+                max_area = area
+                break
+
+        if best_quad is None and sorted_contours:
+            largest = sorted_contours[0]
+            if cv2.contourArea(largest) > total_area * 0.40:
+                hull = cv2.convexHull(largest)
+                peri = cv2.arcLength(hull, True)
+                approx = cv2.approxPolyDP(hull, 0.03 * peri, True)
+                if len(approx) == 4:
+                    best_quad = approx.reshape(4, 2)
+
+        if best_quad is not None:
+            pts = best_quad / scale
+            rect = order_points(pts)
+            (tl, tr, br, bl) = rect
+
+            width_a = np.linalg.norm(br - bl)
+            width_b = np.linalg.norm(tr - tl)
+            max_w = max(int(width_a), int(width_b))
+
+            height_a = np.linalg.norm(tr - br)
+            height_b = np.linalg.norm(tl - bl)
+            max_h = max(int(height_a), int(height_b))
+
+            dst = np.array([
+                [0, 0],
+                [max_w - 1, 0],
+                [max_w - 1, max_h - 1],
+                [0, max_h - 1]
+            ], dtype="float32")
+
+            M = cv2.getPerspectiveTransform(rect, dst)
+            return cv2.warpPerspective(orig, M, (max_w, max_h), flags=cv2.INTER_CUBIC)
+
+        return orig
 
     @staticmethod
-    def dewarp_3d_surface(image: np.ndarray) -> np.ndarray:
+    def dewarp_3d_surface(image: np.ndarray, strength: float = 0.0) -> np.ndarray:
         """
-        High-performance 3D non-rigid dewarping.
-        Estimates page surface displacement vectors along horizontal text baselines and spine curvature
-        to project curved surfaces back into an orthogonal planar representation.
+        Adaptive 3D curvature unrolling. Strength 0.0 preserves planar lines.
         """
+        if strength <= 0.0:
+            return image
+
         h, w = image.shape[:2]
         grid_x, grid_y = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
 
-        # Spine curvature compensation vector field
         curve_profile = np.sin(np.linspace(0, np.pi, h))[:, None]
         horizontal_decay = np.exp(-((grid_x - (w * 0.15)) / (w * 0.25)) ** 2)
-        displacement_x = curve_profile * horizontal_decay * (w * 0.035)
+        displacement_x = curve_profile * horizontal_decay * (w * strength)
 
         map_x = np.clip(grid_x - displacement_x, 0, w - 1).astype(np.float32)
         map_y = grid_y.astype(np.float32)
@@ -119,41 +178,41 @@ class DocumentGeometryEngine:
 
 
 class OcclusionRemovalEngine:
-    """Engine 4: Finger / Thumb Segmentation & Clean Paper Inpainting"""
+    """Engine 4: Finger / Thumb Segmentation & Clean Margin Inpainting"""
     @staticmethod
     def detect_finger_mask(image: np.ndarray) -> np.ndarray:
-        """Segments fingers/thumbs holding page margins using adaptive skin-chroma modeling."""
         h, w = image.shape[:2]
         mask = np.zeros((h, w), dtype=np.uint8)
 
-        border_mask = np.ones((h, w), dtype=np.uint8)
-        inner_y1, inner_y2 = int(h * 0.12), int(h * 0.88)
-        inner_x1, inner_x2 = int(w * 0.12), int(w * 0.88)
-        border_mask[inner_y1:inner_y2, inner_x1:inner_x2] = 0
+        border_mask = np.zeros((h, w), dtype=np.uint8)
+        border_w = int(w * 0.10)
+        border_h = int(h * 0.10)
+        border_mask[:border_h, :] = 255
+        border_mask[-border_h:, :] = 255
+        border_mask[:, :border_w] = 255
+        border_mask[:, -border_w:] = 255
 
         ycrcb = cv2.cvtColor(image, cv2.COLOR_BGR2YCrCb)
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
 
         skin_ycrcb = cv2.inRange(ycrcb, np.array([0, 133, 77]), np.array([255, 173, 127]))
-        skin_hsv = cv2.inRange(hsv, np.array([0, 30, 60]), np.array([25, 200, 255]))
+        skin_hsv = cv2.inRange(hsv, np.array([0, 25, 50]), np.array([30, 220, 255]))
 
         combined_skin = cv2.bitwise_and(skin_ycrcb, skin_hsv)
         candidate_mask = cv2.bitwise_and(combined_skin, combined_skin, mask=border_mask)
 
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
         candidate_mask = cv2.morphologyEx(candidate_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-        candidate_mask = cv2.dilate(candidate_mask, kernel, iterations=2)
 
         contours, _ = cv2.findContours(candidate_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for c in contours:
-            if cv2.contourArea(c) > (w * h * 0.003):
+            if cv2.contourArea(c) > (w * h * 0.002):
                 cv2.drawContours(mask, [c], -1, 255, -1)
 
         return mask
 
     @staticmethod
     def inpaint_fingers(image: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        """Inpaints occluded finger regions using Fast Marching / Telea texture synthesis."""
         if np.count_nonzero(mask) == 0:
             return image
         dilated_mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)), iterations=2)
@@ -161,34 +220,54 @@ class OcclusionRemovalEngine:
 
 
 class IlluminationRegularizationEngine:
-    """Engine 5: Paper Whitening & Spine Shadow Elimination"""
+    """Engine 5: Paper Whitening & Spine Shadow Elimination (vFlat / CamScanner Magic Color)"""
     @staticmethod
-    def whiten_and_neutralize_shadows(image: np.ndarray, target_paper_white: int = 250) -> np.ndarray:
-        channels = cv2.split(image)
-        whitened_channels = []
+    def whiten_paper_vflat_style(image: np.ndarray, whiteness_gain: float = 1.15) -> np.ndarray:
+        """
+        1. Estimates smooth background illumination in LAB luminance space.
+        2. Neutralizes shadows and maps paper to clean white.
+        3. Preserves blue ink, red margin lines, and pen strokes with high contrast.
+        """
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
 
-        k_size = max(31, int(min(image.shape[:2]) * 0.05) | 1)
+        h, w = l.shape
+        scale = 800.0 / max(h, w)
+        sw, sh = int(w * scale), int(h * scale)
+        l_small = cv2.resize(l, (sw, sh), interpolation=cv2.INTER_AREA)
+
+        k_size = 51
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_size, k_size))
+        bg_small = cv2.morphologyEx(l_small, cv2.MORPH_CLOSE, kernel)
+        bg_small = cv2.GaussianBlur(bg_small, (51, 51), 0)
 
-        for ch in channels:
-            bg = cv2.morphologyEx(ch, cv2.MORPH_CLOSE, kernel)
-            bg = cv2.GaussianBlur(bg, (21, 21), 0)
-            divided = np.clip((ch.astype(np.float32) / (bg.astype(np.float32) + 1e-5)) * target_paper_white, 0, 255).astype(np.uint8)
-            whitened_channels.append(divided)
+        bg = cv2.resize(bg_small, (w, h), interpolation=cv2.INTER_CUBIC)
 
-        result = cv2.merge(whitened_channels)
-        gaussian = cv2.GaussianBlur(result, (0, 0), 2.0)
-        enhanced = cv2.addWeighted(result, 1.25, gaussian, -0.25, 0)
+        l_float = l.astype(np.float32)
+        bg_float = np.maximum(bg.astype(np.float32), 1.0)
+        l_norm = (l_float / bg_float) * 235.0
+
+        l_white = np.clip(l_norm * whiteness_gain, 0, 255)
+        paper_mask = l_white > 220
+        l_white[paper_mask] = 220 + (l_white[paper_mask] - 220) * 1.0
+        l_final = np.clip(l_white, 0, 255).astype(np.uint8)
+
+        lab_clean = cv2.merge([l_final, a, b])
+        result = cv2.cvtColor(lab_clean, cv2.COLOR_LAB2BGR)
+
+        blur = cv2.GaussianBlur(result, (0, 0), 3.0)
+        enhanced = cv2.addWeighted(result, 1.2, blur, -0.2, 0)
         return np.clip(enhanced, 0, 255).astype(np.uint8)
 
 
 class ScannerPipelineOrchestrator:
     """End-to-End Batch Orchestrator and PDF Assembly"""
     def __init__(self, enable_orientation: bool = True, enable_deskew: bool = True,
-                 enable_dewarp: bool = True, enable_finger_removal: bool = True,
-                 enable_whitening: bool = True):
+                 enable_crop: bool = True, enable_dewarp: bool = False,
+                 enable_finger_removal: bool = True, enable_whitening: bool = True):
         self.enable_orientation = enable_orientation
         self.enable_deskew = enable_deskew
+        self.enable_crop = enable_crop
         self.enable_dewarp = enable_dewarp
         self.enable_finger_removal = enable_finger_removal
         self.enable_whitening = enable_whitening
@@ -207,16 +286,17 @@ class ScannerPipelineOrchestrator:
         timings['orientation_deskew_ms'] = round((time.time() - t0) * 1000, 1)
         stages['1_oriented'] = current.copy()
 
-        # 2. Crop & Margin
+        # 2. 4-Corner Quad Perspective Warp & Isolation
         t0 = time.time()
-        current = DocumentGeometryEngine.crop_with_margin(current, margin_ratio=0.015)
-        timings['crop_margin_ms'] = round((time.time() - t0) * 1000, 1)
-        stages['2_cropped'] = current.copy()
+        if self.enable_crop:
+            current = DocumentGeometryEngine.detect_and_warp_quad(current)
+        timings['crop_perspective_ms'] = round((time.time() - t0) * 1000, 1)
+        stages['2_cropped_quad'] = current.copy()
 
-        # 3. 3D Dewarp
+        # 3. 3D Dewarp (Adaptive)
         t0 = time.time()
         if self.enable_dewarp:
-            current = DocumentGeometryEngine.dewarp_3d_surface(current)
+            current = DocumentGeometryEngine.dewarp_3d_surface(current, strength=0.02)
         timings['dewarp_3d_ms'] = round((time.time() - t0) * 1000, 1)
         stages['3_dewarped'] = current.copy()
 
@@ -229,10 +309,10 @@ class ScannerPipelineOrchestrator:
         timings['finger_removal_ms'] = round((time.time() - t0) * 1000, 1)
         stages['4_inpainted'] = current.copy()
 
-        # 5. Whitening & Shadow Removal
+        # 5. Paper Whitening & Illumination Regularization
         t0 = time.time()
         if self.enable_whitening:
-            current = IlluminationRegularizationEngine.whiten_and_neutralize_shadows(current)
+            current = IlluminationRegularizationEngine.whiten_paper_vflat_style(current)
         timings['whitening_ms'] = round((time.time() - t0) * 1000, 1)
         stages['5_whitened_final'] = current.copy()
 
@@ -258,9 +338,7 @@ def main():
     parser = argparse.ArgumentParser(description="AI Book & Document Scanner Engine")
     parser.add_argument("--input", "-i", type=str, default="input_images", help="Input directory of image photos")
     parser.add_argument("--output", "-o", type=str, default="scanned_book.pdf", help="Output PDF file path")
-    parser.add_argument("--no-dewarp", action="store_true", help="Disable 3D dewarping")
-    parser.add_argument("--no-finger", action="store_true", help="Disable finger inpainting")
-    parser.add_argument("--no-whiten", action="store_true", help="Disable paper whitening")
+    parser.add_argument("--dewarp", action="store_true", help="Enable 3D spine dewarping")
     args = parser.parse_args()
 
     extensions = ('*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG')
@@ -270,15 +348,11 @@ def main():
     images = sorted(list(set(images)))
 
     if not images:
-        print(f"No image files found in {args.input}. Supported formats: jpg, jpeg, png.")
+        print(f"No image files found in {args.input}.")
         return
 
     print(f"Found {len(images)} images in {args.input}. Processing...")
-    orchestrator = ScannerPipelineOrchestrator(
-        enable_dewarp=not args.no_dewarp,
-        enable_finger_removal=not args.no_finger,
-        enable_whitening=not args.no_whiten
-    )
+    orchestrator = ScannerPipelineOrchestrator(enable_dewarp=args.dewarp)
 
     temp_out_dir = os.path.join(args.input, "_processed_temp")
     os.makedirs(temp_out_dir, exist_ok=True)
@@ -305,4 +379,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
