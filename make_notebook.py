@@ -20,6 +20,17 @@ def create_notebook():
             "metadata": {},
             "outputs": [],
             "source": [
+                "# @title 🔄 Git Sync: Pull Latest Updates\n",
+                "# Run this cell anytime updates or improvements are pushed to GitHub!\n",
+                "!git pull 2>/dev/null || echo \"Working directory is ready.\"\n"
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
                 "# @title 🚀 Step 1: Environment Setup & Dependency Installation\n",
                 "import os\n",
                 "import sys\n",
