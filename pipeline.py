@@ -46,10 +46,10 @@ class DocumentPreprocessingEngine:
         if lines is None:
             return image
 
+        lines = lines.reshape(-1, 4)
         angles = []
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
-            theta = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+        for x1, y1, x2, y2 in lines:
+            theta = np.degrees(np.arctan2(float(y2 - y1), float(x2 - x1)))
             if abs(theta) <= max_angle:
                 angles.append(theta)
             elif abs(abs(theta) - 90) <= max_angle:
@@ -92,9 +92,10 @@ class DocumentGeometryEngine:
         pad_y = int(h * margin_ratio)
         x1 = max(0, x - pad_x)
         y1 = max(0, y - pad_y)
-        x2 = min(img_w, x + w + pad_x)
-        y2 = min(img_h, y + h + pad_y)
-        return image[y1:y2, x1:x2]
+        if y2 <= y1 or x2 <= x1:
+            return image
+        cropped = image[y1:y2, x1:x2]
+        return cropped if cropped.size > 0 else image
 
     @staticmethod
     def dewarp_3d_surface(image: np.ndarray) -> np.ndarray:
